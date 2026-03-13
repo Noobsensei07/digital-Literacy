@@ -6,63 +6,40 @@ const Tesseract = require('tesseract.js');
 const path = require('path');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Helper: Google Safe Browsing Check
-// ═══════════════════════════════════════════════════════════════════════════
-const checkGoogleSafeBrowsing = async (url) => {
-    const apiKey = process.env.SAFE_BROWSING_API_KEY;
-    if (!apiKey) return null; // Gracefully pass
-
-    try {
-        const body = {
-            client: {
-                clientId: "dlip_app",
-                clientVersion: "1.0.0"
-            },
-            threatInfo: {
-                threatTypes: ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
-                platformTypes: ["ANY_PLATFORM"],
-                threatEntryTypes: ["URL"],
-                threatEntries: [{ url }]
-            }
-        };
-
-        const response = await axios.post(`https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${apiKey}`, body);
-        const data = response.data;
-        if (data && data.matches && data.matches.length > 0) {
-            return "Danger: Google Safe Browsing explicitly flagged this URL as malware/phishing.";
-        }
-    } catch (e) {
-        console.error("Safe Browsing API Error:", e.message);
-    }
-    return null;
-};
-
 // Utility to sleep for polling if needed
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PHISHING / SUSPICIOUS DOMAIN BLOCKLIST (120+)
-// ═══════════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════
-// NEW: User-Requested Heuristics Arrays
+// CUSTOM SAFE BROWSING: Offline Heuristic Network
 // ═══════════════════════════════════════════════════════════════════════════
 const suspiciousTLDs = [
     '.xyz', '.top', '.club', '.work', '.click', '.link', '.info', '.online',
     '.site', '.live', '.store', '.icu', '.buzz', '.gq', '.ml', '.ga', '.cf',
-    '.tk', '.pw', '.cc', '.ws', '.space', '.fun', '.monster', '.rest'
+    '.tk', '.pw', '.cc', '.ws', '.space', '.fun', '.monster', '.rest', '.loan',
+    '.win', '.trade', '.date', '.party', '.science', '.cricket', '.download'
 ];
 
 const phishingKeywords = [
     'login', 'verify', 'update', 'confirm', 'secure', 'account', 'signin',
     'billing', 'suspend', 'locked', 'alert', 'urgent', 'expired', 'renew',
-    'password', 'credential', 'authenticate', 'validate', 'recover'
+    'password', 'credential', 'authenticate', 'validate', 'recover', 'wallet',
+    'support', 'helpdesk', 'service', 'admin', 'auth', 'authorize', 'claim'
+];
+
+const malwareExtensions = [
+    '.exe', '.apk', '.bat', '.cmd', '.scr', '.vbs', '.js', '.jar', '.ps1',
+    '.msi', '.bin', '.sh', '.py', '.php', '.zip', '.rar', '.7z', '.cab'
+];
+
+const typoSquattingKeywords = [
+    '0', '1', 'l', 'i', 'rn', 'vv', 'cl', '-', 'support', 'help', 'login', 'auth'
 ];
 
 const knownFakeDomains = [
     'secure-login-verify.xyz', 'verification-support.com', 'bank-crew-mvgr.space',
-    'paypa1.com', 'g00gle.com', 'faceb00k.com', 'amaz0n.com',
-    'micr0soft.com', 'app1e.com', 'netf1ix.com', 'lnstagram.com'
+    'paypa1.com', 'g00gle.com', 'faceb00k.com', 'amaz0n.com', 'micr0soft.com', 
+    'app1e.com', 'netf1ix.com', 'lnstagram.com', 'lnkedin.com', '0utlook.com',
+    'yah00.com', 'chase-login-update.com', 'wellsfargo-secure.com', 'bofa-alert.com'
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -98,8 +75,8 @@ function analyzeUrlHeuristics(targetUrl) {
             }
         }
 
-        // 3.5. Brand spoofing checks
-        const strictBrands = ['paypal', 'apple', 'amazon', 'netflix', 'microsoft', 'google'];
+        // 3.5. Brand spoofing checks & Typo-Squatting logic
+        const strictBrands = ['paypal', 'apple', 'amazon', 'netflix', 'microsoft', 'google', 'chase', 'bankofamerica', 'wellsfargo', 'citibank'];
         for (const brand of strictBrands) {
             if (hostname.includes(brand)) {
                 // If it contains a brand word, but does NOT end with ".brand.com" or exactly equal "brand.com"
@@ -107,6 +84,22 @@ function analyzeUrlHeuristics(targetUrl) {
                     status = "Fraud";
                     details.push(`High risk spoofing detected: Domain impersonates ${brand.toUpperCase()}.`);
                 }
+            } else {
+                // Look for common character replacements (0 for o, 1 for l, rn for m) inside the hostname
+                const normalizedHost = hostname.replace(/0/g, 'o').replace(/1/g, 'l').replace(/rn/g, 'm').replace(/vv/g, 'w');
+                if (normalizedHost.includes(brand)) {
+                    status = "Fraud";
+                    details.push(`Advanced Typo-Squatting detected: Visual spoofing of ${brand.toUpperCase()}.`);
+                }
+            }
+        }
+
+        // 3.8. Malware File Load Check
+        for (const ext of malwareExtensions) {
+            // Check if the URL path ends with an executable or high-risk extension
+            if (pathLower.endsWith(ext) || pathLower.includes(`${ext}?`)) {
+                status = "Fraud";
+                details.push(`Malware Distribution Risk: URL attempts to download or execute a '${ext}' file.`);
             }
         }
 
@@ -189,16 +182,8 @@ const scanUrl = async (req, res) => {
             heuristicResult.details.push("VirusTotal skipped: Missing API Key.");
         }
 
-        const sbPromise = checkGoogleSafeBrowsing(targetUrl);
-
-        // Await both simultaneously
-        const [vtResponse, sbWarning] = await Promise.all([vtPromise, sbPromise]);
-
-        // Integrate Google Safe Browsing Results
-        if (sbWarning) {
-            heuristicResult.status = "Fraud";
-            heuristicResult.details.push(sbWarning);
-        }
+        // Await VirusTotal (if applicable)
+        const vtResponse = await vtPromise;
 
         // Integrate VirusTotal Results
         if (vtResponse && vtResponse.data) {
