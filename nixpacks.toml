@@ -1,0 +1,6 @@
+[providers]
+node = true
+python = true
+
+[phases.setup]
+nixPkgs = ["python3"]
